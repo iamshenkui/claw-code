@@ -160,22 +160,54 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
+    // Common OpenAI model families: gpt-*, o1, o1-*, o3, o3-*, o4-*
+    if canonical.starts_with("gpt-")
+        || canonical == "o1"
+        || canonical.starts_with("o1-")
+        || canonical == "o3"
+        || canonical.starts_with("o3-")
+        || canonical.starts_with("o4-")
+    {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        });
+    }
     None
 }
 
 #[must_use]
 pub fn detect_provider_kind(model: &str) -> ProviderKind {
+    // Explicit provider override via CLAW_PROVIDER env var.
+    if let Ok(provider) = std::env::var("CLAW_PROVIDER") {
+        match provider.to_ascii_lowercase().as_str() {
+            "anthropic" | "claude" => return ProviderKind::Anthropic,
+            "xai" | "grok" => return ProviderKind::Xai,
+            "openai" => return ProviderKind::OpenAi,
+            other => {
+                eprintln!(
+                    "warning: unknown CLAW_PROVIDER value {:?}; ignoring and detecting from model name/credentials",
+                    other
+                );
+            }
+        }
+    }
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
-    if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
-        return ProviderKind::Anthropic;
-    }
+    // Check explicit API keys before Anthropic OAuth so that users who have
+    // configured a non-Anthropic provider alongside Anthropic credentials get
+    // correct routing for unrecognised model names.
     if openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;
     }
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
+    }
+    if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
+        return ProviderKind::Anthropic;
     }
     ProviderKind::Anthropic
 }
@@ -214,5 +246,40 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+    }
+
+    #[test]
+    fn claw_provider_override() {
+        std::env::set_var("CLAW_PROVIDER", "openai");
+        assert_eq!(
+            detect_provider_kind("claude-opus-4-6"),
+            ProviderKind::OpenAi
+        );
+        std::env::remove_var("CLAW_PROVIDER");
+
+        std::env::set_var("CLAW_PROVIDER", "xai");
+        assert_eq!(detect_provider_kind("claude-opus-4-6"), ProviderKind::Xai);
+        std::env::remove_var("CLAW_PROVIDER");
+
+        std::env::set_var("CLAW_PROVIDER", "anthropic");
+        assert_eq!(
+            detect_provider_kind("claude-opus-4-6"),
+            ProviderKind::Anthropic
+        );
+        std::env::remove_var("CLAW_PROVIDER");
+
+        // Unknown CLAW_PROVIDER is ignored (warns to stderr); model name wins.
+        std::env::set_var("CLAW_PROVIDER", "my-custom-llm");
+        assert_eq!(
+            detect_provider_kind("claude-opus-4-6"),
+            ProviderKind::Anthropic // model name "claude-*" → Anthropic, not silent OpenAI
+        );
+        std::env::remove_var("CLAW_PROVIDER");
+
+        // Without CLAW_PROVIDER, model-based detection is unchanged.
+        assert_eq!(
+            detect_provider_kind("claude-opus-4-6"),
+            ProviderKind::Anthropic
+        );
     }
 }
