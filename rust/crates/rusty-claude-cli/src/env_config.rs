@@ -73,7 +73,7 @@ fn all_provider_specs() -> &'static [ProviderEnvSpec] {
                     EnvVarSpec {
                         key: "ANTHROPIC_BASE_URL",
                         description: "Anthropic API endpoint",
-                        default_value: Some("https://api.anthropic.com"),
+                        default_value: Some("https://openrouter.ai/api"),
                     },
                 ],
                 or_group: Some(vec!["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]),
@@ -307,7 +307,8 @@ fn generate_env_content(active: &ProviderEnvSpec) -> String {
         for var in &spec.vars {
             if is_active {
                 // Active provider: key is uncommented so user can fill it in.
-                lines.push(format!("{}=", var.key));
+                // For vars with a sensible default (e.g. base URLs), prefill it.
+                lines.push(format!("{}={}", var.key, var.default_value.unwrap_or("")));
             } else {
                 // Inactive providers: commented out with description.
                 lines.push(format!("# {}={}", var.key, var.default_value.unwrap_or("")));
@@ -325,6 +326,8 @@ fn generate_env_content(active: &ProviderEnvSpec) -> String {
     lines.push("#   4. Compiled-in default (claude-opus-4-6)".to_string());
     lines.push("".to_string());
     lines.push("# Global model override — applies regardless of active provider.".to_string());
+    lines.push("# For OpenRouter and other Anthropic-compatible gateways, prefer CLAW_MODEL".to_string());
+    lines.push("# and set it to the provider slug directly (examples below).".to_string());
     lines.push("# CLAW_MODEL=".to_string());
     lines.push("".to_string());
 
@@ -343,19 +346,26 @@ fn generate_env_content(active: &ProviderEnvSpec) -> String {
     }
 
     // Provider/routing notes section
-    lines.push("# --- Routing notes ---".to_string());
-    lines.push("# The CLI runtime always uses the Anthropic Messages protocol.".to_string());
-    lines.push("# CLAW_PROVIDER only affects which credentials env_config validates on startup.".to_string());
-    lines.push("# To route through a proxy (e.g. OpenRouter), redirect the Anthropic endpoint:".to_string());
+    lines.push("# --- OpenRouter example ---".to_string());
+    lines.push("# OpenRouter works well via the Anthropic-compatible path:".to_string());
     lines.push("#   ANTHROPIC_BASE_URL=https://openrouter.ai/api   # client appends /v1/messages".to_string());
-    lines.push("#   ANTHROPIC_API_KEY=sk-or-...                    # your OpenRouter key".to_string());
-    lines.push("#   CLAW_MODEL=anthropic/claude-opus-4-6           # OpenRouter model slug".to_string());
-    lines.push("# Note: OpenAI/xAI provider credentials below are validated but not used".to_string());
-    lines.push("# by the main conversation runtime in this build.".to_string());
+    lines.push("#   ANTHROPIC_AUTH_TOKEN=sk-or-...                 # your OpenRouter key".to_string());
+    lines.push("#   CLAW_MODEL=minimax/minimax-m2.7               # any OpenRouter model slug".to_string());
+    lines.push("# Example Anthropic-family slugs on OpenRouter:".to_string());
+    lines.push("#   CLAW_MODEL=anthropic/claude-opus-4.6".to_string());
+    lines.push("#   CLAW_MODEL=anthropic/claude-sonnet-4.6".to_string());
+    lines.push("# Example non-Anthropic slugs on OpenRouter:".to_string());
+    lines.push("#   CLAW_MODEL=z-ai/glm-5-turbo".to_string());
+    lines.push("#   CLAW_MODEL=xiaomi/mimo-v2-omni".to_string());
     lines.push("".to_string());
-    lines.push("# CLAW_PROVIDER controls which provider's credentials are checked at startup.".to_string());
+    lines.push("# --- Provider selection ---".to_string());
+    lines.push("# CLAW_PROVIDER is optional. Set it only when you want to force credential".to_string());
+    lines.push("# validation/routing to anthropic, xai, or openai explicitly.".to_string());
     lines.push("# Values: anthropic (default), xai, openai".to_string());
     lines.push("# CLAW_PROVIDER=".to_string());
+    lines.push("".to_string());
+    lines.push("# Legacy vars such as ANTHROPIC_SMALL_FAST_MODEL and".to_string());
+    lines.push("# ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU}_MODEL are not read by this CLI.".to_string());
 
     lines.join("\n")
 }
@@ -626,6 +636,10 @@ mod tests {
             content.contains("\nANTHROPIC_API_KEY="),
             "active key should be uncommented"
         );
+        assert!(
+            content.contains("\nANTHROPIC_BASE_URL=https://openrouter.ai/api"),
+            "active Anthropic base URL should default to OpenRouter"
+        );
 
         // Inactive provider keys should be commented out.
         assert!(
@@ -635,6 +649,18 @@ mod tests {
         assert!(
             content.contains("# XAI_API_KEY="),
             "inactive key should be commented"
+        );
+        assert!(
+            content.contains("ANTHROPIC_AUTH_TOKEN=sk-or-..."),
+            "template should include OpenRouter auth token example"
+        );
+        assert!(
+            content.contains("CLAW_MODEL=minimax/minimax-m2.7"),
+            "template should include OpenRouter model slug example"
+        );
+        assert!(
+            content.contains("ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU}_MODEL are not read"),
+            "template should clarify legacy Anthropic helper vars are ignored"
         );
     }
 
@@ -647,10 +673,16 @@ mod tests {
             content.contains("\nXAI_API_KEY="),
             "active xAI key should be uncommented"
         );
+        assert!(
+            content.contains("\nXAI_BASE_URL=https://api.x.ai/v1"),
+            "active xAI base URL should use the provider default"
+        );
     }
 
     #[test]
     fn test_patch_adds_missing_keys() {
+        let _guard = crate::test_env_lock();
+        env::remove_var("CLAW_PROVIDER");
         with_temp_dir(|dir| {
             let env_file = dir.join(".env");
             fs::write(&env_file, "ANTHROPIC_API_KEY=sk-existing\n").unwrap();
@@ -666,6 +698,8 @@ mod tests {
 
     #[test]
     fn test_patch_skips_existing_keys() {
+        let _guard = crate::test_env_lock();
+        env::remove_var("CLAW_PROVIDER");
         with_temp_dir(|dir| {
             let env_file = dir.join(".env");
             fs::write(

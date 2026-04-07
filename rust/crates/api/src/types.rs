@@ -1,6 +1,13 @@
 use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+fn deserialize_u32_or_default<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<u32>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageRequest {
@@ -149,11 +156,13 @@ pub enum OutputContentBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    #[serde(deserialize_with = "deserialize_u32_or_default")]
     pub input_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_or_default")]
     pub cache_creation_input_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u32_or_default")]
     pub cache_read_input_tokens: u32,
+    #[serde(deserialize_with = "deserialize_u32_or_default")]
     pub output_tokens: u32,
 }
 
@@ -248,6 +257,7 @@ pub enum StreamEvent {
 #[cfg(test)]
 mod tests {
     use runtime::format_usd;
+    use serde_json::json;
 
     use super::{MessageResponse, Usage};
 
@@ -286,5 +296,21 @@ mod tests {
         let cost = response.usage.estimated_cost_usd(&response.model);
         assert_eq!(format_usd(cost.total_cost_usd()), "$54.6750");
         assert_eq!(response.total_tokens(), 1_800_000);
+    }
+
+    #[test]
+    fn usage_deserialization_treats_null_numeric_fields_as_zero() {
+        let usage: Usage = serde_json::from_value(json!({
+            "input_tokens": 6,
+            "cache_creation_input_tokens": null,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 64
+        }))
+        .expect("usage with null fields should deserialize");
+
+        assert_eq!(usage.input_tokens, 6);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.output_tokens, 64);
     }
 }
