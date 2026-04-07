@@ -120,6 +120,7 @@ pub struct MessageResponse {
     pub stop_reason: Option<String>,
     #[serde(default)]
     pub stop_sequence: Option<String>,
+    #[serde(default)]
     pub usage: Usage,
     #[serde(default)]
     pub request_id: Option<String>,
@@ -154,15 +155,15 @@ pub enum OutputContentBlock {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
-    #[serde(deserialize_with = "deserialize_u32_or_default")]
+    #[serde(default, deserialize_with = "deserialize_u32_or_default")]
     pub input_tokens: u32,
     #[serde(default, deserialize_with = "deserialize_u32_or_default")]
     pub cache_creation_input_tokens: u32,
     #[serde(default, deserialize_with = "deserialize_u32_or_default")]
     pub cache_read_input_tokens: u32,
-    #[serde(deserialize_with = "deserialize_u32_or_default")]
+    #[serde(default, deserialize_with = "deserialize_u32_or_default")]
     pub output_tokens: u32,
 }
 
@@ -203,6 +204,7 @@ pub struct MessageStartEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageDeltaEvent {
     pub delta: MessageDelta,
+    #[serde(default)]
     pub usage: Usage,
 }
 
