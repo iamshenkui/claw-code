@@ -28,6 +28,7 @@ use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
     AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient,
     ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
 };
@@ -56,13 +57,20 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{
+    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     api::max_tokens_for_model(model)
 }
-const DEFAULT_DATE: &str = "2026-03-31";
+// Build-time constants injected by build.rs (fall back to static values when
+// build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
+const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
+    Some(d) => d,
+    None => "unknown",
+};
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
@@ -202,10 +210,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
         } => {
             run_stale_base_preflight(base_commit.as_deref());
-            let stdin_context = read_piped_stdin();
+            // Only consume piped stdin as prompt context when the permission
+            // mode is fully unattended. In modes where the permission
+            // prompter may invoke CliPermissionPrompter::decide(), stdin
+            // must remain available for interactive approval; otherwise the
+            // prompter's read_line() would hit EOF and deny every request.
+            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
+                read_piped_stdin()
+            } else {
+                None
+            };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             LiveCli::new(model, true, allowed_tools, permission_mode)?
-                 .run_turn_with_output(&effective_prompt, output_format, compact)?;
+                .run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -948,11 +965,7 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader
-        .load()
-        .ok()?
-        .model()
-        .map(ToOwned::to_owned)
+    loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
@@ -1027,10 +1040,7 @@ fn parse_system_prompt_args(
     })
 }
 
-fn parse_export_args(
-    args: &[String],
-    output_format: CliOutputFormat,
-) -> Result<CliAction, String> {
+fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
     let mut output_path: Option<PathBuf> = None;
     let mut index = 0;
@@ -1342,8 +1352,13 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     let state_path = cwd.join(".claw").join("worker-state.json");
     if !state_path.exists() {
         match output_format {
-            CliOutputFormat::Text => println!("No worker state file found at {}", state_path.display()),
-            CliOutputFormat::Json => println!("{}", serde_json::json!({"error": "no_state_file", "path": state_path.display().to_string()})),
+            CliOutputFormat::Text => {
+                println!("No worker state file found at {}", state_path.display())
+            }
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::json!({"error": "no_state_file", "path": state_path.display().to_string()})
+            ),
         }
         return Ok(());
     }
@@ -2666,7 +2681,8 @@ fn run_resume_command(
             json: None,
         }),
         SlashCommand::History { count } => {
-            let limit = parse_history_count(count.as_deref()).map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let limit = parse_history_count(count.as_deref())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let entries = collect_session_prompt_history(session);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -4402,6 +4418,22 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
             return Ok(path);
         }
     }
+    // Backward compatibility: pre-isolation sessions were stored at
+    // `.claw/sessions/<id>.{jsonl,json}` without the per-workspace hash
+    // subdirectory. Walk up from `directory` to the `.claw/sessions/` root
+    // and try the flat layout as a fallback so users do not lose access
+    // to their pre-upgrade managed sessions.
+    if let Some(legacy_root) = directory
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+    {
+        for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
+            let path = legacy_root.join(format!("{session_id}.{extension}"));
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
     Err(format_missing_session_reference(session_id).into())
 }
 
@@ -4413,9 +4445,14 @@ fn is_managed_session_file(path: &Path) -> bool {
         })
 }
 
-fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    let mut sessions = Vec::new();
-    for entry in fs::read_dir(sessions_dir()?)? {
+fn collect_sessions_from_dir(
+    directory: &Path,
+    sessions: &mut Vec<ManagedSessionSummary>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         if !is_managed_session_file(&path) {
@@ -4465,6 +4502,24 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             branch_name,
         });
     }
+    Ok(())
+}
+
+fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    let mut sessions = Vec::new();
+    let primary_dir = sessions_dir()?;
+    collect_sessions_from_dir(&primary_dir, &mut sessions)?;
+
+    // Backward compatibility: include sessions stored in the pre-isolation
+    // flat `.claw/sessions/` root so users do not lose access to existing
+    // managed sessions after the workspace-hashed subdirectory rollout.
+    if let Some(legacy_root) = primary_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+    {
+        collect_sessions_from_dir(legacy_root, &mut sessions)?;
+    }
+
     sessions.sort_by(|left, right| {
         right
             .modified_epoch_millis
@@ -5343,16 +5398,18 @@ fn format_history_timestamp(timestamp_ms: u64) -> String {
     let seconds = seconds_of_day % 60;
 
     let (year, month, day) = civil_from_days(i64::try_from(days_since_epoch).unwrap_or(0));
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec_ms:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec_ms:03}Z")
 }
 
 // Computes civil (Gregorian) year/month/day from days since the Unix epoch
 // (1970-01-01) using Howard Hinnant's `civil_from_days` algorithm.
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u64; // [0, 146_096]
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe as i64 + era * 400;
@@ -6306,9 +6363,15 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
+// NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
+// now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
+// OpenAI, or DashScope at construction time based on
+// `detect_provider_kind(&model)`. The struct name is kept to avoid
+// churning `BuiltRuntime` and every Deref/DerefMut site that references
+// it. See ROADMAP #29 for the provider-dispatch routing fix.
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ApiProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -6328,11 +6391,51 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Dispatch to the correct provider at construction time.
+        // `ApiProviderClient` (exposed by the api crate as
+        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
+        // variants, where xAI and OpenAI both use the OpenAI-compat
+        // wire format under the hood. We consult
+        // `detect_provider_kind(&resolved_model)` so model-name prefix
+        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
+        // env-var presence.
+        //
+        // For Anthropic we build the client directly instead of going
+        // through `ApiProviderClient::from_model_with_anthropic_auth`
+        // so we can explicitly apply `api::read_base_url()` — that
+        // reads `ANTHROPIC_BASE_URL` and is required for the local
+        // mock-server test harness
+        // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
+        // claw at its fake Anthropic endpoint. We also attach a
+        // session-scoped prompt cache on the Anthropic path; the
+        // prompt cache is Anthropic-only so non-Anthropic variants
+        // skip it.
+        let resolved_model = api::resolve_model_alias(&model);
+        let client = match detect_provider_kind(&resolved_model) {
+            ProviderKind::Anthropic => {
+                let auth = resolve_cli_auth_source()?;
+                let inner = AnthropicClient::from_auth(auth)
+                    .with_base_url(api::read_base_url())
+                    .with_prompt_cache(PromptCache::new(session_id));
+                ApiProviderClient::Anthropic(inner)
+            }
+            ProviderKind::Xai | ProviderKind::OpenAi => {
+                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
+                // with `None` for the anthropic auth routes via
+                // `detect_provider_kind` and builds an
+                // `OpenAiCompatClient::from_env` with the matching
+                // `OpenAiCompatConfig` (openai / xai / dashscope).
+                // That reads the correct API-key env var and BASE_URL
+                // override internally, so this one call covers OpenAI,
+                // OpenRouter, xAI, DashScope, Ollama, and any other
+                // OpenAI-compat endpoint users configure via
+                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+            }
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -6387,6 +6490,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            ..Default::default()
         };
 
         self.runtime.block_on(async {
@@ -6402,7 +6506,10 @@ impl ApiClient for AnthropicRuntimeClient {
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
-                    Err(error) if error.to_string().contains("post-tool stall") && attempt < max_attempts => {
+                    Err(error)
+                        if error.to_string().contains("post-tool stall")
+                            && attempt < max_attempts =>
+                    {
                         // Stalled after tool completion — nudge the model by
                         // re-sending the same request.
                         continue;
@@ -6411,9 +6518,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 }
             }
 
-            Err(RuntimeError::new(
-                "post-tool continuation nudge exhausted",
-            ))
+            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         })
     }
 }
@@ -6427,13 +6532,13 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream =
-            self.client
-                .stream_message(message_request)
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?;
+        let mut stream = self
+            .client
+            .stream_message(message_request)
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+            })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -6453,10 +6558,7 @@ impl AnthropicRuntimeClient {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
                     Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(
-                            &self.session_id,
-                            &error,
-                        ))
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
                     })?,
                     Err(_elapsed) => {
                         return Err(RuntimeError::new(
@@ -6640,9 +6742,15 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             context_window_tokens,
         } => {
             lines.push(format!("  Model            {model}"));
-            lines.push(format!("  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"));
-            lines.push(format!("  Requested output {requested_output_tokens} tokens"));
-            lines.push(format!("  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"));
+            lines.push(format!(
+                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
+            ));
+            lines.push(format!(
+                "  Requested output {requested_output_tokens} tokens"
+            ));
+            lines.push(format!(
+                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
+            ));
             lines.push(format!("  Context window   {context_window_tokens} tokens"));
         }
         api::ApiError::Api { message, body, .. } => {
@@ -6744,6 +6852,7 @@ impl ApiClient for OpenAiCompatRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            ..Default::default()
         };
 
         self.runtime.block_on(async {
@@ -7616,7 +7725,12 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
+    // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
+    // to the Anthropic variant and returns `None` for OpenAI-compat /
+    // xAI variants, which do not have a prompt cache. So this helper
+    // remains a no-op on non-Anthropic providers without any extra
+    // branching here.
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -7874,7 +7988,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
-    writeln!(out, "  claw export [PATH] [--session SESSION] [--output PATH]")?;
+    writeln!(
+        out,
+        "  claw export [PATH] [--session SESSION] [--output PATH]"
+    )?;
     writeln!(
         out,
         "      Dump the latest (or named) session as markdown; writes to PATH or stdout"
@@ -7939,10 +8056,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --output-format json prompt \"explain src/main.rs\""
     )?;
-    writeln!(
-        out,
-        "  claw --compact \"summarize Cargo.toml\" | wc -l"
-    )?;
+    writeln!(out, "  claw --compact \"summarize Cargo.toml\" | wc -l")?;
     writeln!(
         out,
         "  claw --allowedTools read,glob \"summarize Cargo.toml\""
@@ -8005,18 +8119,19 @@ mod tests {
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
-        print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, slash_command_completion_candidates_with_sessions, status_context,
-        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        PromptHistoryEntry, render_prompt_history_report, parse_history_count,
-        parse_export_args, render_session_markdown, summarize_tool_payload_for_markdown, short_tool_id,
+        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        parse_history_count, permission_policy, print_help_to, push_output_block,
+        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, status_context,
+        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
+        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8880,8 +8995,12 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args(&["state".to_string(), "--output-format".to_string(), "json".to_string()])
-                .expect("state --output-format json should parse"),
+            parse_args(&[
+                "state".to_string(),
+                "--output-format".to_string(),
+                "json".to_string()
+            ])
+            .expect("state --output-format json should parse"),
             CliAction::State {
                 output_format: CliOutputFormat::Json,
             }
@@ -9298,11 +9417,14 @@ mod tests {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         clear_model_env_vars();
+        // Input is ["help", "me", "debug"] so the joined prompt shorthand
+        // must be "help me debug". A previous batch accidentally rewrote
+        // the expected string to "$help overview" (copy-paste slip).
         assert_eq!(
             parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
-                prompt: "$help overview".to_string(),
+                prompt: "help me debug".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -9619,7 +9741,9 @@ mod tests {
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
-        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]]"));
+        // Batch 5 added `/session delete`; match on the stable core rather than
+        // the trailing bracket so future additions don't re-break this.
+        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]"));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
@@ -9712,8 +9836,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::set_var("ANTHROPIC_MODEL", "sonnet");
 
-        let resolved =
-            with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, "claude-sonnet-4-6");
 
@@ -9732,8 +9855,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
 
-        let resolved =
-            with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, DEFAULT_MODEL);
 
@@ -11098,6 +11220,8 @@ UU conflicted.rs",
 
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
+        // Serialize access to process-wide env vars so parallel tests that
+        // set/remove ANTHROPIC_API_KEY do not race with this test.
         let _guard = env_lock();
         let config_home = temp_dir();
         // Inject a dummy API key so runtime construction succeeds without real credentials.

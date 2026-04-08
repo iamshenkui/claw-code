@@ -251,31 +251,6 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
-fn read_git_recent_commits(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args([
-            "--no-optional-locks",
-            "log",
-            "--oneline",
-            "--no-decorate",
-            "-n",
-            "5",
-        ])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 fn read_git_diff(cwd: &Path) -> Option<String> {
     let mut sections = Vec::new();
 
@@ -737,8 +712,16 @@ mod tests {
             .render();
 
         // then: branch, recent commits and staged files are present in context
-        let gc = context.git_context.as_ref().expect("git context should be present");
-        let commits: String = gc.recent_commits.iter().map(|c| c.subject.clone()).collect::<Vec<_>>().join("\n");
+        let gc = context
+            .git_context
+            .as_ref()
+            .expect("git context should be present");
+        let commits: String = gc
+            .recent_commits
+            .iter()
+            .map(|c| c.subject.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(commits.contains("first commit"));
         assert!(commits.contains("second commit"));
         assert!(commits.contains("third commit"));
