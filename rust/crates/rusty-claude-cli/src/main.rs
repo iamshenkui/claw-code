@@ -202,14 +202,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-            compact: _,
+            compact,
             base_commit,
         } => {
             run_stale_base_preflight(base_commit.as_deref());
             let stdin_context = read_piped_stdin();
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             LiveCli::new(model, true, allowed_tools, permission_mode)?
-                .run_turn_with_output(&effective_prompt, output_format, false)?;
+                 .run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -8588,6 +8588,7 @@ mod tests {
         // given a bare prompt invocation that includes the --compact flag
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        clear_model_env_vars();
         let args = vec![
             "--compact".to_string(),
             "summarize".to_string(),
@@ -8617,6 +8618,7 @@ mod tests {
         // given a `prompt` subcommand invocation without --compact
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        clear_model_env_vars();
         let args = vec!["prompt".to_string(), "hello".to_string()];
 
         // when parse_args runs
