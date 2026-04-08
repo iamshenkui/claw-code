@@ -658,7 +658,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "setting": { "type": "string" },
                     "value": {
-                        "type": ["string", "boolean", "number"]
+                        "description": "Optional new value. Runtime accepts string, boolean, or number and validates it against the selected setting."
                     }
                 },
                 "required": ["setting"],
@@ -691,6 +691,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             description: "Return structured output in the requested format.",
             input_schema: json!({
                 "type": "object",
+                "properties": {},
+                "minProperties": 1,
                 "additionalProperties": true
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -5425,6 +5427,36 @@ mod tests {
         assert!(names.contains(&"WorkerObserve"));
         assert!(names.contains(&"WorkerAwaitReady"));
         assert!(names.contains(&"WorkerSendPrompt"));
+    }
+
+    #[test]
+    fn config_schema_avoids_provider_specific_union_types() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "Config")
+            .expect("Config tool spec should exist");
+
+        assert_eq!(spec.input_schema["type"], "object");
+        assert_eq!(spec.input_schema["properties"]["setting"]["type"], "string");
+        assert!(spec.input_schema["properties"]["value"].get("type").is_none());
+        assert!(spec.input_schema["properties"]["value"]
+            ["description"]
+            .as_str()
+            .expect("value description")
+            .contains("string, boolean, or number"));
+    }
+
+    #[test]
+    fn structured_output_schema_declares_object_properties() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "StructuredOutput")
+            .expect("StructuredOutput tool spec should exist");
+
+        assert_eq!(spec.input_schema["type"], "object");
+        assert_eq!(spec.input_schema["properties"], json!({}));
+        assert_eq!(spec.input_schema["minProperties"], 1);
+        assert_eq!(spec.input_schema["additionalProperties"], true);
     }
 
     #[test]

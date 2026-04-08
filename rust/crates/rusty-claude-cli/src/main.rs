@@ -60,11 +60,7 @@ use tools::{execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinit
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
+    api::max_tokens_for_model(model)
 }
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
@@ -3313,7 +3309,7 @@ impl LiveCli {
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         env_config::ensure_env_for_provider(&model)?;
-        let system_prompt = build_system_prompt()?;
+        let system_prompt = build_system_prompt(&model)?;
         let session_state = Session::new();
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -3438,12 +3434,17 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                println!();
+                if summary_has_visible_output(&summary) {
+                    writeln!(stdout)?;
+                    stdout.flush()?;
+                } else {
+                    spinner.finish(
+                        "✨ Done",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                    println!();
+                }
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
@@ -5733,7 +5734,7 @@ fn short_tool_id(id: &str) -> String {
     format!("{prefix}…")
 }
 
-fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn build_system_prompt(_model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
@@ -6941,6 +6942,25 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+fn summary_has_visible_output(summary: &runtime::TurnSummary) -> bool {
+    if !final_assistant_text(summary).trim().is_empty() {
+        return true;
+    }
+
+    if !summary.tool_results.is_empty() {
+        return true;
+    }
+
+    summary.assistant_messages.iter().any(|message| {
+        message.blocks.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+            )
+        })
+    })
 }
 
 fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {

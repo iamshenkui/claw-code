@@ -345,6 +345,7 @@ impl AnthropicClient {
         let response = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;
+        let response = ensure_streaming_response(response).await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
@@ -919,6 +920,36 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     })
 }
 
+async fn ensure_streaming_response(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
+    let is_event_stream = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    if is_event_stream {
+        return Ok(response);
+    }
+
+    let status = response.status();
+    let request_id = request_id_from_headers(response.headers());
+    let body = response.text().await.unwrap_or_else(|_| String::new());
+    let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
+
+    Err(ApiError::Api {
+        status,
+        error_type: parsed_error
+            .as_ref()
+            .map(|error| error.error.error_type.clone()),
+        message: parsed_error
+            .as_ref()
+            .map(|error| error.error.message.clone())
+            .or_else(|| Some("expected text/event-stream response".to_string())),
+        request_id,
+        body,
+        retryable: false,
+    })
+}
+
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
 }
@@ -957,8 +988,9 @@ mod tests {
     use runtime::{clear_oauth_credentials, save_oauth_credentials, OAuthConfig};
 
     use super::{
-        now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
-        resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
+        client_runtime_block_on, now_unix_timestamp, oauth_token_is_expired,
+        resolve_saved_oauth_token, resolve_startup_auth_source, AnthropicClient, AuthSource,
+        OAuthTokenSet,
     };
     use crate::types::{ContentBlockDelta, MessageRequest};
 
@@ -1469,5 +1501,41 @@ mod tests {
             rendered.get("model").and_then(serde_json::Value::as_str),
             Some("claude-sonnet-4-6")
         );
+    }
+
+    #[test]
+    fn stream_message_surfaces_json_error_body_when_endpoint_does_not_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let body = r#"{"error":{"type":"invalid_request_error","message":"Provider returned error"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let client = AnthropicClient::new("test-key").with_base_url(format!("http://{address}"));
+        let request = MessageRequest {
+            model: "google/gemini-3.1-pro-preview".to_string(),
+            max_tokens: 8_192,
+            messages: vec![],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: true,
+        };
+
+        let error = client_runtime_block_on(async { client.stream_message(&request).await })
+            .expect_err("non-streaming JSON error body should be surfaced");
+        assert!(matches!(error, crate::error::ApiError::Api { .. }));
+        assert!(error.to_string().contains("Provider returned error"));
     }
 }

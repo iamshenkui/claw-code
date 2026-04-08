@@ -226,7 +226,9 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
     model_token_limit(model).map_or_else(
         || {
             let canonical = resolve_model_alias(model);
-            if canonical.contains("opus") {
+            if canonical.contains('/') {
+                8_192
+            } else if canonical.contains("opus") {
                 32_000
             } else {
                 64_000
@@ -388,6 +390,7 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("google/gemini-3.1-pro-preview"), 8_192);
     }
 
     #[test]
